@@ -297,94 +297,117 @@ class TokenMeta(util.PrintError, metaclass=ABCMeta):
 
 
 def try_to_find_genesis_tx(wallet, token_id_hex, timeout=30) -> Optional[Transaction]:
-    """This is potentially slow because it does go out to the network and may end up retrieving quite a few
-    transactions to determine what spent token_id_hex:0."""
+    """Find the genesis tx for a token. The genesis tx is the one that spends
+    output 0 of the authbase (token_id_hex)."""
     assert isinstance(token_id_hex, str) and len(token_id_hex) == 64
-    # First, see if it's a wallet tx, find the pre-genesis
     try:
-        tx = wallet.try_to_get_tx(token_id_hex, allow_network_lookup=True, timeout=timeout)
+        authbase_tx = wallet.try_to_get_tx(token_id_hex, allow_network_lookup=True, timeout=timeout)
     except util.TimeoutException as e:
-        util.print_error(f"Failed to get pre-genesis tx for {token_id_hex}; got exception: {e!r}")
+        util.print_error(f"Failed to get authbase tx {token_id_hex}: {e!r}")
         return None
-    if not tx:
-        util.print_error(f"Failed to get pre-genesis tx for {token_id_hex}; not found")
+    if not authbase_tx:
+        util.print_error(f"Authbase tx {token_id_hex} not found")
         return None
+    genesis_tx = _find_child_spending_output0(wallet, authbase_tx, token_id_hex, timeout)
+    if not genesis_tx:
+        util.print_error(f"Genesis tx not found for authbase {token_id_hex}")
+    return genesis_tx
 
-    # Next, see what address spends output 0
-    addr_or_script = tx.outputs()[0][1] if tx.outputs() else None
-    if not addr_or_script:
-        util.print_error(f"Failed to get pre-genesis tx for {token_id_hex}; no outputs!")
+
+def _scripthash_for_output0(tx) -> Optional[str]:
+    """Compute the scripthash for output 0 of a tx directly from its raw scriptPubKey,
+    bypassing Address objects to avoid any address-format complications."""
+    from electroncash.transaction import deserialize as tx_deserialize
+    if not tx.raw:
         return None
-    # Maybe it's one of ours?
-    h = wallet.get_address_history(addr_or_script)
-    if not h:
-        # Nope, get a full address history from the network for this address
-        if not wallet.network:
-            util.print_error(f"Failed to get pre-genesis tx for {token_id_hex}; no network!")
-            return None
+    try:
+        d = tx_deserialize(tx.raw)
+    except Exception:
+        return None
+    outputs = d.get('outputs', [])
+    if not outputs:
+        return None
+    spk_hex = outputs[0].get('scriptPubKey')
+    if not spk_hex:
+        return None
+    spk_bytes = bytes.fromhex(spk_hex)
+    return hashlib.sha256(spk_bytes).digest()[::-1].hex()
+
+
+def _find_child_spending_output0(wallet, parent_tx, parent_txid, timeout=30) -> Optional[Transaction]:
+    """Given a transaction, find the tx that spends its output 0. Returns None if output 0 is unspent.
+    Always queries the network for the address history to ensure completeness."""
+    if not wallet.network:
+        return None
+    scripthash = _scripthash_for_output0(parent_tx)
+    if not scripthash:
+        return None
+    try:
+        util.print_error(f"_find_child: parent={parent_txid}, scripthash={scripthash}")
+        request = ("blockchain.scripthash.get_history", [scripthash])
+        h2 = wallet.network.synchronous_get(request, timeout=timeout)
+    except Exception as e:
+        util.print_error(f"Failed to get history for scripthash {scripthash}: {e!r}")
+        return None
+    util.print_error(f"_find_child: history has {len(h2)} entries: {[x.get('tx_hash','') for x in h2]}")
+    for item in h2:
+        tx_hash = item.get('tx_hash', '')
+        if tx_hash == parent_txid:
+            continue
         try:
-            request = ("blockchain.scripthash.get_history", [addr_or_script.to_scripthash_hex()])
-            h2 = wallet.network.synchronous_get(request)
-        except Exception as e:
-            util.print_error(f"Failed to get pre-genesis tx for {token_id_hex};"
-                             f" failed to retrieve history for {addr_or_script}; got exception: {e!r}")
+            tx2 = wallet.try_to_get_tx(tx_hash, allow_network_lookup=True, timeout=timeout)
+        except util.TimeoutException:
             return None
-        h = [(x.get('tx_hash', ''), x.get('height', 0)) for x in h2]
-
-    # Next, find the height for the pre-genesis tx
-    for tx_hash, height in h:
-        if tx_hash == token_id_hex:
-            confirmed_height = height
-            break
-    else:
-        util.print_error(f"Failed to get pre-genesis tx for {token_id_hex};"
-                         f" could not find tx in history for {addr_or_script}")
-        return None
-
-    # Examine all txns that are >= the height of the pre-genesis
-    for tx_hash, height in h:
-        is_candidate = height <= 0 or height >= confirmed_height  # Pick up mempool + anything >= confirmed_height
-        if is_candidate and tx_hash != token_id_hex:
-            try:
-                tx2 = wallet.try_to_get_tx(tx_hash, allow_network_lookup=True, timeout=timeout)
-            except util.TimeoutException as e:
-                util.print_error(f"Failed to get pre-genesis tx for {token_id_hex}; could not get potential child tx"
-                                 f" {tx_hash}; got exception: {e!r}")
-                return None
-            if not tx2:
-                util.print_error(f"Failed to get pre-genesis tx for {token_id_hex}; could not get potential"
-                                 f" child tx {tx_hash}")
-                return None
-            for inp in tx2.inputs():
-                if inp['prevout_n'] == 0 and inp['prevout_hash'] == token_id_hex:
-                    # Found it!
-                    return tx2
-    else:
-        util.print_error(f"Failed to get pre-genesis tx for {token_id_hex};"
-                         f" found the tx but could not find its child tx in history!")
+        if not tx2:
+            continue
+        for inp in tx2.inputs():
+            if inp['prevout_n'] == 0 and inp['prevout_hash'] == parent_txid:
+                return tx2
     return None
 
 
-def try_to_get_bcmr_op_return_pushes(wallet, token_id_hex, timeout=30) -> Optional[List[bytes]]:
-    """Synchronously finds the genesis tx by calling try_to_find_genesis_tx(), and attempts to parse it."""
-    tx = try_to_find_genesis_tx(wallet, token_id_hex, timeout)
-    if not tx:
-        return None
+def _get_bcmr_pushes_from_tx(tx) -> Optional[List[bytes]]:
+    """Check a transaction for a BCMR publication output. Returns the OP_RETURN
+    pushes (hash + urls) if found, or None."""
     for i, (_, script, _) in enumerate(tx.outputs()):
         if isinstance(script, address.ScriptOutput) and script.is_opreturn():
             try:
                 pushes = address.Script.get_ops(script.to_script()[1:])
-            except address.ScriptError as e:
-                util.print_error(f"Tx: {token_id_hex} Output: {i}, could not parse OP_RETURN"
-                                 f" {script.to_script().hex()}: {e!r}")
+            except address.ScriptError:
                 continue
             if (all(isinstance(t, tuple) and len(t) == 2 and isinstance(t[0], int)
                     and isinstance(t[1], (bytes, bytearray)) for t in pushes)
-                and len(pushes) >= 2 and pushes[0] == (4, b'BCMR') and pushes[1][0] == 32):
+                    and len(pushes) >= 2 and pushes[0] == (4, b'BCMR') and pushes[1][0] == 32):
                 return [p[1] for p in pushes[1:]]
-            else:
-                util.print_error(f"Tx: {token_id_hex} Output: {i}, malformed BCMR OP_RETURN:"
-                                 f" {script.to_script().hex()}, pushes: {pushes!r}")
+    return None
+
+
+def try_to_get_bcmr_op_return_pushes(wallet, token_id_hex, timeout=30) -> Optional[List[bytes]]:
+    """Walk the authchain from genesis to authhead, keeping the most recent
+    BCMR publication output found along the way."""
+    genesis_tx = try_to_find_genesis_tx(wallet, token_id_hex, timeout)
+    if not genesis_tx:
+        return None
+
+    best_pushes = None
+    current_tx = genesis_tx
+    current_txid = current_tx.txid()
+
+    for depth in range(100):
+        pushes = _get_bcmr_pushes_from_tx(current_tx)
+        if pushes is not None:
+            util.print_error(f"Found BCMR publication in authchain tx {current_txid} at depth {depth}")
+            best_pushes = pushes
+
+        child = _find_child_spending_output0(wallet, current_tx, current_txid, timeout)
+        if child is None:
+            # Output 0 is unspent — current_tx is the authhead
+            util.print_error(f"Reached authhead for {token_id_hex} at depth {depth}: {current_txid}")
+            break
+        current_tx = child
+        current_txid = current_tx.txid()
+
+    return best_pushes
 
 
 class DownloadedMetaData:
@@ -465,7 +488,7 @@ def _try_to_dl_from_paytaca_indexer(token_id_hex, timeout=30, *, skip_icon=False
                                     nft_hex=None) -> Optional[DownloadedMetaData]:
     """Download metadata from the paytaca indexer"""
     host = networks.net.PAYTACA_HOST
-    if not host:
+    if host:
         return None
     if not nft_hex:
         url = f"https://{host}/api/tokens/{token_id_hex}/"
