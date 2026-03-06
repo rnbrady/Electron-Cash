@@ -9,6 +9,7 @@
 import hashlib
 import json
 import os
+import queue
 import requests
 import threading
 
@@ -296,6 +297,24 @@ class TokenMeta(util.PrintError, metaclass=ABCMeta):
         return format_str.format(token_name=tn, token_symbol=tsym)
 
 
+def _get_tx_height(wallet, tx_hash, timeout=30) -> int:
+    """Get the confirmed block height for a tx. Tries wallet cache first,
+    then falls back to network lookup. Returns 0 if unknown."""
+    height, _, _ = wallet.get_tx_height(tx_hash)
+    if height > 0:
+        return height
+    if not wallet.network:
+        return 0
+    try:
+        height = wallet.network.synchronous_get(
+            ("blockchain.transaction.get_height", [tx_hash]), timeout=timeout)
+        if isinstance(height, int) and height > 0:
+            return height
+    except Exception:
+        pass
+    return 0
+
+
 def try_to_find_genesis_tx(wallet, token_id_hex, timeout=30) -> Optional[Transaction]:
     """Find the genesis tx for a token. The genesis tx is the one that spends
     output 0 of the authbase (token_id_hex)."""
@@ -308,7 +327,9 @@ def try_to_find_genesis_tx(wallet, token_id_hex, timeout=30) -> Optional[Transac
     if not authbase_tx:
         util.print_error(f"Authbase tx {token_id_hex} not found")
         return None
-    genesis_tx = _find_child_spending_output0(wallet, authbase_tx, token_id_hex, timeout)
+    from_height = _get_tx_height(wallet, token_id_hex, timeout)
+    genesis_tx = _find_child_spending_output0(wallet, authbase_tx, token_id_hex, timeout,
+                                              from_height=from_height)
     if not genesis_tx:
         util.print_error(f"Genesis tx not found for authbase {token_id_hex}")
     return genesis_tx
@@ -334,26 +355,143 @@ def _scripthash_for_output0(tx) -> Optional[str]:
     return hashlib.sha256(spk_bytes).digest()[::-1].hex()
 
 
-def _find_child_spending_output0(wallet, parent_tx, parent_txid, timeout=30) -> Optional[Transaction]:
+def _find_child_spending_output0(wallet, parent_tx, parent_txid, timeout=30,
+                                 from_height=0) -> Optional[Transaction]:
     """Given a transaction, find the tx that spends its output 0. Returns None if output 0 is unspent.
-    Always queries the network for the address history to ensure completeness."""
+    Runs a UTXO walk-back and history scan in parallel — first to find the child wins.
+    from_height is passed to get_history to limit results to txs at or above that block height."""
     if not wallet.network:
         return None
     scripthash = _scripthash_for_output0(parent_tx)
     if not scripthash:
         return None
+    # Fast path: check UTXOs at the same address as parent:0
     try:
-        util.print_error(f"_find_child: parent={parent_txid}, scripthash={scripthash}")
-        request = ("blockchain.scripthash.get_history", [scripthash])
-        h2 = wallet.network.synchronous_get(request, timeout=timeout)
+        utxos = wallet.network.synchronous_get(
+            ("blockchain.scripthash.listunspent", [scripthash]), timeout=timeout)
+        util.print_error(f"_find_child: {parent_txid} listunspent returned {len(utxos)} UTXOs")
     except Exception as e:
-        util.print_error(f"Failed to get history for scripthash {scripthash}: {e!r}")
-        return None
-    util.print_error(f"_find_child: history has {len(h2)} entries: {[x.get('tx_hash','') for x in h2]}")
-    for item in h2:
-        tx_hash = item.get('tx_hash', '')
-        if tx_hash == parent_txid:
+        util.print_error(f"_find_child: listunspent failed for {scripthash}: {e!r}, trying history")
+        return _find_child_via_history(wallet, scripthash, parent_txid, timeout, from_height)
+    # If parent:0 is itself unspent, there is no child
+    for u in utxos:
+        if u['tx_hash'] == parent_txid and u['tx_pos'] == 0:
+            util.print_error(f"_find_child: {parent_txid}:0 is unspent (fast path)")
+            return None
+    # Parent:0 is spent — run UTXO walk-back and history scan in parallel.
+    # History scan runs in a daemon thread; UTXO walk-back runs in current thread.
+    # First to find the child wins.
+    result_q = queue.Queue()
+
+    def history_worker():
+        try:
+            result = _find_child_via_history(wallet, scripthash, parent_txid, timeout,
+                                             from_height, stop_check=result_q)
+            result_q.put(result)
+        except Exception:
+            result_q.put(None)
+
+    hist_thread = threading.Thread(target=history_worker, daemon=True)
+    hist_thread.start()
+    # UTXO walk-back in current thread, checking result_q between fetches
+    # so we bail out early if the history thread finds the child first.
+    checked = {parent_txid}
+    max_walk_depth = 3
+    max_utxo_checks = 30
+    utxo_found = None
+    for u in utxos:
+        if len(checked) >= max_utxo_checks:
+            break
+        if not result_q.empty():
+            util.print_error("_find_child: history thread found result, aborting UTXO walk-back")
+            break
+        tx_hash = u['tx_hash']
+        if tx_hash in checked:
             continue
+        checked.add(tx_hash)
+        try:
+            tx2 = wallet.try_to_get_tx(tx_hash, allow_network_lookup=True, timeout=timeout)
+        except util.TimeoutException:
+            continue
+        if not tx2:
+            continue
+        # Direct child check
+        for inp in tx2.inputs():
+            if inp['prevout_n'] == 0 and inp['prevout_hash'] == parent_txid:
+                util.print_error(f"_find_child: found child {tx_hash} via UTXO heuristic")
+                utxo_found = tx2
+                break
+        if utxo_found:
+            break
+        # Walk back up to max_walk_depth hops through parent txs
+        frontier = []
+        for inp in tx2.inputs():
+            ph = inp['prevout_hash']
+            if ph not in checked:
+                frontier.append(ph)
+        for depth in range(max_walk_depth - 1):
+            next_frontier = []
+            for prev_hash in frontier:
+                if len(checked) >= max_utxo_checks:
+                    break
+                if not result_q.empty():
+                    break
+                if prev_hash in checked:
+                    continue
+                checked.add(prev_hash)
+                try:
+                    prev_tx = wallet.try_to_get_tx(prev_hash, allow_network_lookup=True,
+                                                   timeout=timeout)
+                except util.TimeoutException:
+                    continue
+                if not prev_tx:
+                    continue
+                for inp in prev_tx.inputs():
+                    if inp['prevout_n'] == 0 and inp['prevout_hash'] == parent_txid:
+                        util.print_error(f"_find_child: found child {prev_hash} via UTXO"
+                                         f" walk-back (depth {depth + 2} from {tx_hash})")
+                        utxo_found = prev_tx
+                        break
+                if utxo_found:
+                    break
+                for inp in prev_tx.inputs():
+                    ph = inp['prevout_hash']
+                    if ph not in checked:
+                        next_frontier.append(ph)
+            if utxo_found or not result_q.empty():
+                break
+            frontier = next_frontier
+    if utxo_found:
+        return utxo_found
+    util.print_error(f"_find_child: UTXO heuristic checked {len(checked) - 1} txs, no child found")
+    # Walk-back failed or aborted — get history result
+    try:
+        result = result_q.get(True, timeout)
+    except queue.Empty:
+        result = None
+    return result
+
+
+def _find_child_via_history(wallet, scripthash, parent_txid, timeout=30,
+                            from_height=0, stop_check=None) -> Optional[Transaction]:
+    """Search address history for the tx that spends parent_txid:0.
+    If stop_check (a queue) is provided and non-empty, bail out early (other search found it)."""
+    try:
+        params = [scripthash, from_height] if from_height > 0 else [scripthash]
+        util.print_error(f"_find_child_hist: parent={parent_txid}, scripthash={scripthash},"
+                         f" from_height={from_height}")
+        h2 = wallet.network.synchronous_get(
+            ("blockchain.scripthash.get_history", params), timeout=timeout)
+    except Exception as e:
+        util.print_error(f"_find_child_hist: get_history failed for {scripthash}: {e!r}")
+        return None
+    candidates = [item for item in h2 if item.get('tx_hash', '') != parent_txid]
+    util.print_error(f"_find_child_hist: history has {len(h2)} entries, {len(candidates)} candidates")
+    for item in candidates:
+        if stop_check is not None and not stop_check.empty():
+            util.print_error("_find_child_hist: stopping early, other search found result")
+            return None
+        tx_hash = item.get('tx_hash', '')
         try:
             tx2 = wallet.try_to_get_tx(tx_hash, allow_network_lookup=True, timeout=timeout)
         except util.TimeoutException:
@@ -362,6 +500,7 @@ def _find_child_spending_output0(wallet, parent_tx, parent_txid, timeout=30) -> 
             continue
         for inp in tx2.inputs():
             if inp['prevout_n'] == 0 and inp['prevout_hash'] == parent_txid:
+                util.print_error(f"_find_child_hist: found child {tx_hash}")
                 return tx2
     return None
 
@@ -382,31 +521,124 @@ def _get_bcmr_pushes_from_tx(tx) -> Optional[List[bytes]]:
     return None
 
 
+def _walk_back_to_genesis(wallet, tx, genesis_txid, timeout=30,
+                          max_depth=100) -> Tuple[bool, Optional[List[bytes]]]:
+    """Walk backwards from tx following inputs that spend output 0, looking for
+    a connection to genesis_txid. Returns (connected, best_pushes) where
+    best_pushes is the most recent BCMR publication found during the walk
+    (closest to the starting tx)."""
+    best_pushes = None
+    current_tx = tx
+    for depth in range(max_depth):
+        # Find inputs spending output 0 of some parent
+        for inp in current_tx.inputs():
+            if inp['prevout_n'] != 0:
+                continue
+            prev_hash = inp['prevout_hash']
+            if prev_hash == genesis_txid:
+                util.print_error(f"_walk_back: reached genesis {genesis_txid} at depth {depth}")
+                return True, best_pushes
+            try:
+                prev_tx = wallet.try_to_get_tx(prev_hash, allow_network_lookup=True, timeout=timeout)
+            except util.TimeoutException:
+                continue
+            if not prev_tx:
+                continue
+            # Check for BCMR publication in this intermediate tx
+            pushes = _get_bcmr_pushes_from_tx(prev_tx)
+            if pushes is not None and best_pushes is None:
+                # Keep the most recent (closest to authhead)
+                util.print_error(f"_walk_back: found BCMR in {prev_hash} at depth {depth}")
+                best_pushes = pushes
+            current_tx = prev_tx
+            break  # Follow the first prevout_n==0 input found
+        else:
+            # No input with prevout_n==0 found
+            util.print_error(f"_walk_back: no prevout_n==0 input at depth {depth}")
+            return False, best_pushes
+    return False, best_pushes
+
+
 def try_to_get_bcmr_op_return_pushes(wallet, token_id_hex, timeout=30) -> Optional[List[bytes]]:
-    """Walk the authchain from genesis to authhead, keeping the most recent
-    BCMR publication output found along the way."""
+    """Find the authhead and return its BCMR publication pushes. Uses a UTXO-based
+    heuristic (authhead likely shares address with genesis output 0) with walk-back
+    verification, falling back to forward walk if needed."""
     genesis_tx = try_to_find_genesis_tx(wallet, token_id_hex, timeout)
     if not genesis_tx:
         return None
+    genesis_txid = genesis_tx.txid()
+    genesis_pushes = _get_bcmr_pushes_from_tx(genesis_tx)
 
-    best_pushes = None
+    # If genesis output 0 is OP_RETURN, it's unspendable — genesis is the authhead.
+    # Per BCMR spec this is a "burned" identity, but it may still contain the publication.
+    outputs = genesis_tx.outputs()
+    if outputs and isinstance(outputs[0][1], address.ScriptOutput) and outputs[0][1].is_opreturn():
+        util.print_error(f"Genesis {genesis_txid} output 0 is OP_RETURN — genesis is authhead")
+        return genesis_pushes
+
+    # Get UTXOs at the genesis output 0 address
+    scripthash = _scripthash_for_output0(genesis_tx)
+    if not scripthash or not wallet.network:
+        # Can't do UTXO heuristic, check genesis only
+        return genesis_pushes
+
+    try:
+        utxos = wallet.network.synchronous_get(
+            ("blockchain.scripthash.listunspent", [scripthash]), timeout=timeout)
+    except Exception as e:
+        util.print_error(f"listunspent failed for genesis output 0: {e!r}")
+        return genesis_pushes
+
+    # Check if genesis:0 is unspent — genesis is the authhead
+    for u in utxos:
+        if u['tx_hash'] == genesis_txid and u['tx_pos'] == 0:
+            util.print_error(f"Genesis {genesis_txid} is authhead (output 0 unspent)")
+            return genesis_pushes
+
+    # Genesis:0 is spent — authhead is further down the chain.
+    # Heuristic: check UTXOs at this address, walk back to verify connection.
+    for u in utxos:
+        tx_hash = u['tx_hash']
+        try:
+            utxo_tx = wallet.try_to_get_tx(tx_hash, allow_network_lookup=True, timeout=timeout)
+        except util.TimeoutException:
+            continue
+        if not utxo_tx:
+            continue
+        # Only consider UTXOs at output 0 — potential authhead identity outputs
+        if u['tx_pos'] != 0:
+            continue
+        connected, walkback_pushes = _walk_back_to_genesis(wallet, utxo_tx, genesis_txid, timeout)
+        if connected:
+            util.print_error(f"Found authhead via walk-back: {tx_hash}")
+            # Per spec, authhead's publication takes precedence
+            authhead_pushes = _get_bcmr_pushes_from_tx(utxo_tx)
+            if authhead_pushes:
+                return authhead_pushes
+            # Fallback: most recent publication found during walk-back
+            if walkback_pushes:
+                return walkback_pushes
+            # Last resort: genesis publication
+            return genesis_pushes
+
+    # Heuristic failed — authchain left the address. Fall back to forward walk.
+    util.print_error(f"UTXO heuristic failed for {token_id_hex}, falling back to forward walk")
+    best_pushes = genesis_pushes
     current_tx = genesis_tx
-    current_txid = current_tx.txid()
-
+    current_txid = genesis_txid
     for depth in range(100):
-        pushes = _get_bcmr_pushes_from_tx(current_tx)
-        if pushes is not None:
-            util.print_error(f"Found BCMR publication in authchain tx {current_txid} at depth {depth}")
-            best_pushes = pushes
-
-        child = _find_child_spending_output0(wallet, current_tx, current_txid, timeout)
+        current_height = _get_tx_height(wallet, current_txid, timeout)
+        child = _find_child_spending_output0(wallet, current_tx, current_txid, timeout,
+                                              from_height=current_height)
         if child is None:
-            # Output 0 is unspent — current_tx is the authhead
-            util.print_error(f"Reached authhead for {token_id_hex} at depth {depth}: {current_txid}")
+            util.print_error(f"Forward walk: authhead at depth {depth}: {current_txid}")
             break
         current_tx = child
         current_txid = current_tx.txid()
-
+        pushes = _get_bcmr_pushes_from_tx(current_tx)
+        if pushes is not None:
+            util.print_error(f"Forward walk: BCMR in {current_txid} at depth {depth}")
+            best_pushes = pushes
     return best_pushes
 
 
